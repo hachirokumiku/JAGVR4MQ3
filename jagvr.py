@@ -4,6 +4,7 @@ import sys
 import numpy as np
 import sdl2
 import openvr
+import base64
 
 LIB_PATH = os.path.join(os.getcwd(), "virtualjaguar_libretro.dll")
 ROM_PATH = os.path.join(os.getcwd(), "mc.rom")
@@ -23,18 +24,12 @@ UPSCALE_FILTER = 0x2601  # GL_LINEAR (use 0x2600 / GL_NEAREST for crisp pixels)
 RENDER_SCALE = 1.0
 
 # --- Faux depth-layer settings -------------------------------------------
-# We don't have access to VirtualJaguar's Object Processor layer data (the
-# libretro core only hands us the final flattened raster via video_cb), so
-# this is a heuristic: split the frame into 3 planes by luminance and give
-# each plane real 3D depth + per-eye disparity. Brighter pixels are treated
-# as "closer" -- true for a lot of retro sprite work (bright sprites/UI over
-# darker backgrounds) but it's a guess, not ground truth. Tune freely.
-THRESH_MID = 90      # luminance 0-255; pixels >= this go on the midground layer
-THRESH_FRONT = 175   # pixels >= this ALSO go on the foreground layer
-BASE_DEPTH = 2.4      # meters -- depth of the background plane
+THRESH_MID = 90
+THRESH_FRONT = 175
+BASE_DEPTH = 2.4
 MID_DEPTH = 1.9
 FRONT_DEPTH = 1.55
-BASE_HEIGHT = 1.3     # meters -- screen height at BASE_DEPTH (sets angular size)
+BASE_HEIGHT = 1.3
 ZNEAR, ZFAR = 0.05, 50.0
 
 print("Pre-compiling ROM into high-speed RAM buffers for zero-latency execution...")
@@ -95,13 +90,147 @@ def audio_sample_batch_cb(data, frames):
     return frames
 
 
+# --- Input: improved OpenVR controller mapping for Quest 3 ---------------
+# We implement a simple poller that reads OpenVR controller states and
+# synthesizes a classic Jaguar controller mapping. This is best-effort and
+# may need tuning for your setup. The plumbing below exposes button states
+# to libretro via input_state_cb.
+
+_controller_state = {
+    'left_axes': (0.0, 0.0),
+    'right_axes': (0.0, 0.0),
+    'left_trigger': 0.0,
+    'right_trigger': 0.0,
+    'left_grip': False,
+    'right_grip': False,
+    'left_buttons': 0,
+    'right_buttons': 0,
+}
+
+# Deadzone for thumbsticks
+_THUMBSTICK_DEADZONE = 0.35
+
+
 @ctypes.CFUNCTYPE(None)
 def input_poll_cb():
-    pass
+    # Poll OpenVR controllers and fill _controller_state
+    try:
+        vr = vr_system
+    except NameError:
+        return
+    # reset
+    s = _controller_state
+    s['left_axes'] = (0.0, 0.0)
+    s['right_axes'] = (0.0, 0.0)
+    s['left_trigger'] = 0.0
+    s['right_trigger'] = 0.0
+    s['left_grip'] = False
+    s['right_grip'] = False
+    s['left_buttons'] = 0
+    s['right_buttons'] = 0
+
+    # Iterate tracked devices and sample controller states
+    for i in range(openvr.k_unMaxTrackedDeviceCount):
+        try:
+            cls = vr.getTrackedDeviceClass(i)
+        except Exception:
+            continue
+        if cls != openvr.TrackedDeviceClass_Controller:
+            continue
+        # Some openvr bindings return a (state, pose) tuple; others return state
+        try:
+            state = vr.getControllerState(i)
+        except Exception:
+            # try the alternative accessor
+            try:
+                state = vr.getControllerStateWithPose(openvr.TrackingUniverseStanding, i)
+            except Exception:
+                continue
+        # unwrap tuple if necessary
+        if isinstance(state, tuple) or isinstance(state, list):
+            state = state[0]
+        # state should have ulButtonPressed and rAxis entries
+        buttons = getattr(state, 'ulButtonPressed', 0)
+        # axes are in rAxis: each axis has x,y floats
+        try:
+            axes = state.rAxis
+        except Exception:
+            axes = None
+        # decide handedness by pose role if available
+        try:
+            role = vr.getControllerRoleForTrackedDeviceIndex(i)
+        except Exception:
+            # fallback unknown: try to assign first controller -> left, second -> right
+            role = None
+        is_left = (role == openvr.TrackedControllerRole_LeftHand)
+        # map axes and triggers depending on controller implementation
+        # Many SteamVR drivers put trigger pressure in rAxis[1].x or rAxis[1].y
+        if axes:
+            ax0 = getattr(axes[0], 'x', 0.0)
+            ay0 = getattr(axes[0], 'y', 0.0)
+            # try axis 1 for trigger/grip if present
+            ax1 = getattr(axes[1], 'x', 0.0) if len(axes) > 1 else 0.0
+            ay1 = getattr(axes[1], 'y', 0.0) if len(axes) > 1 else 0.0
+        else:
+            ax0 = ay0 = ax1 = ay1 = 0.0
+        if is_left:
+            # thumbstick on left
+            s['left_axes'] = (ax0, ay0)
+            s['left_trigger'] = ax1 if abs(ax1) > 0.01 else ay1
+            s['left_buttons'] = buttons
+        else:
+            s['right_axes'] = (ax0, ay0)
+            s['right_trigger'] = ax1 if abs(ax1) > 0.01 else ay1
+            s['right_buttons'] = buttons
+
+
+# Map synthesized controller state to libretro input_state calls.
+# libretro's input_state signature: (port, device, index, id) -> int16
+# We implement a simple mapping: port 0 -> player 1. device ignored.
+# id mapping (choice):
+# 0 = up, 1 = down, 2 = left, 3 = right, 4 = A (primary), 5 = B (secondary),
+# 6 = Option/Secondary keypad, 7 = Pause
 
 
 @ctypes.CFUNCTYPE(ctypes.c_int16, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint)
 def input_state_cb(port, device, index, id):
+    # Only support player 0
+    if port != 0:
+        return 0
+    s = _controller_state
+    # digital D-pad from left thumbstick
+    lx, ly = s['left_axes']
+    up = ly < -_THUMBSTICK_DEADZONE
+    down = ly > _THUMBSTICK_DEADZONE
+    left = lx < -_THUMBSTICK_DEADZONE
+    right = lx > _THUMBSTICK_DEADZONE
+    # primary/secondary mapped to right trigger & left trigger
+    a_pressed = s['right_trigger'] > 0.45 or (s['right_buttons'] & getattr(openvr, 'ButtonMaskFromId', 0))
+    b_pressed = s['left_trigger'] > 0.45
+    # grip presses as a modifier
+    opt = s['left_grip'] or s['right_grip']
+
+    if id == 0:
+        return 1 if up else 0
+    if id == 1:
+        return 1 if down else 0
+    if id == 2:
+        return 1 if left else 0
+    if id == 3:
+        return 1 if right else 0
+    if id == 4:
+        return 1 if a_pressed else 0
+    if id == 5:
+        return 1 if b_pressed else 0
+    if id == 6:
+        return 1 if opt else 0
+    if id == 7:
+        # map menu button (application menu) if present on controller buttons
+        # try to detect application menu bit
+        appmenu_mask = getattr(openvr, 'k_EButton_ApplicationMenu', None)
+        if appmenu_mask is not None:
+            return 1 if (s['left_buttons'] & appmenu_mask or s['right_buttons'] & appmenu_mask) else 0
+        return 0
     return 0
 
 
@@ -132,11 +261,6 @@ game = RetroGameInfo(
 core.retro_load_game(ctypes.byref(game))
 
 # --- Real core memory access (legitimate libretro API, not a DLL hack) ----
-# retro_get_memory_data/size are standard, documented libretro exports --
-# it's the same mechanism RetroArch itself uses for cheats/rewind/achievements.
-# For VirtualJaguar specifically, RETRO_MEMORY_SYSTEM_RAM returns a direct
-# pointer to jaguarMainRAM (the full 2MB Jaguar DRAM), confirmed against the
-# core's own source (libretro.c: retro_get_memory_data/size).
 RETRO_MEMORY_SAVE_RAM = 0
 RETRO_MEMORY_SYSTEM_RAM = 2
 
@@ -153,20 +277,6 @@ if jaguar_ram_addr and jaguar_ram_size:
     print(f"Jaguar system RAM mapped: {jaguar_ram_size} bytes at {hex(jaguar_ram_addr)}")
 else:
     print("Warning: core did not expose RETRO_MEMORY_SYSTEM_RAM; falling back to luminance-only layers.")
-
-# NOTE: this gives us live read access to Jaguar DRAM, but NOT the OLP
-# (Object List Pointer) register -- that's TOM memory-mapped I/O at 0xF00020,
-# outside the RETRO_MEMORY_SYSTEM_RAM window, and libretro's API has no slot
-# for arbitrary MMIO. Two real ways forward if you want true per-object
-# layers instead of the luminance heuristic below:
-#   1) Hardcode the OLP address for a specific ROM once you've found it
-#      (e.g. by dumping jaguar_ram and diffing frames to spot the display
-#      list), and walk the object list format from there.
-#   2) Patch VirtualJaguar's C source (it's GPLv3, github.com/libretro/
-#      virtualjaguar-libretro) to stash the live OLP value somewhere in
-#      jaguarMainRAM's unused tail, or add a new retro_get_memory_data type,
-#      then rebuild the .dll. That's a real build, not something doable by
-#      poking the compiled binary from here.
 
 # --- SDL / GL setup ---------------------------------------------------
 sdl2.SDL_Init(sdl2.SDL_INIT_VIDEO | sdl2.SDL_INIT_AUDIO)
@@ -229,13 +339,28 @@ opengl32.wglGetProcAddress.argtypes = [ctypes.c_char_p]
 
 
 def get_proc(name):
+    # Try the normal wglGetProcAddress first (requires a current GL context).
     addr = opengl32.wglGetProcAddress(name.encode("ascii"))
-    if not addr:
-        raise RuntimeError(
-            f"Could not load GL function '{name}'. Your GPU driver needs "
-            f"GL_ARB_framebuffer_object support for the per-eye render targets."
-        )
-    return addr
+    if addr:
+        return addr
+    # Fall back to an exported symbol on opengl32.dll (some drivers do this).
+    try:
+        exported = getattr(opengl32, name)
+    except AttributeError:
+        exported = None
+    if exported is not None:
+        for attr in ("address", "value"):
+            addr_val = getattr(exported, attr, None)
+            if isinstance(addr_val, int) and addr_val != 0:
+                return addr_val
+        try:
+            return ctypes.cast(exported, ctypes.c_void_p).value
+        except Exception:
+            pass
+    raise RuntimeError(
+        f"Could not load GL function '{name}'. Ensure an OpenGL context is current "
+        f"and your GPU driver supports the required functions (GL_ARB_framebuffer_object, etc.)."
+    )
 
 
 glGenFramebuffers = ctypes.WINFUNCTYPE(None, ctypes.c_int, ctypes.POINTER(ctypes.c_uint))(get_proc("glGenFramebuffers"))
@@ -275,12 +400,6 @@ right_fbo, right_tex = make_eye_fbo(eye_w, eye_h)
 
 eye_bounds = openvr.VRTextureBounds_t()
 eye_bounds.uMin, eye_bounds.uMax = 0.0, 1.0
-# NOTE: no V flip here. The vMin=1/vMax=0 flip only applied to the earlier
-# version, which uploaded raw top-down pixel data straight into a texture
-# via glTexImage2D (a genuine GL-vs-source-data mismatch). Now the eye
-# textures are produced by actually rendering the scene into the FBO, and
-# that rasterizer output already matches the orientation the compositor
-# expects -- flipping it here just puts it upside down again.
 eye_bounds.vMin, eye_bounds.vMax = 0.0, 1.0
 
 left_vr_tex = openvr.Texture_t()
@@ -308,7 +427,6 @@ def ensure_layer_textures(w, h):
 
 
 def upload_layer(name, arr):
-    """arr: numpy uint8 array (h, w, 4) in B,G,R,A byte order -> matches GL_BGRA."""
     tex = layer_tex[name]
     opengl32.glBindTexture(GL_TEXTURE_2D, tex)
     ptr = arr.ctypes.data_as(ctypes.c_void_p)
@@ -318,7 +436,6 @@ def upload_layer(name, arr):
 
 
 def build_depth_layers():
-    """Split the current frame into 3 luminance-thresholded planes."""
     arr = np.frombuffer(fb_data, dtype=np.uint8).reshape(fb_h, fb_w, 4)  # B,G,R,X
     b = arr[..., 0].astype(np.float32)
     g = arr[..., 1].astype(np.float32)
@@ -326,7 +443,7 @@ def build_depth_layers():
     lum = 0.114 * b + 0.587 * g + 0.299 * r
 
     back = arr.copy()
-    back[..., 3] = 255  # background plane is fully opaque
+    back[..., 3] = 255
 
     mid = arr.copy()
     mid[..., 3] = np.where(lum >= THRESH_MID, 255, 0).astype(np.uint8)
@@ -346,25 +463,19 @@ def hmd_mat34_to_np(m):
     rows.append([0.0, 0.0, 0.0, 1.0])
     return np.array(rows, dtype=np.float64)
 
-
 def hmd_mat44_to_np(m):
     return np.array([[m[r][c] for c in range(4)] for r in range(4)], dtype=np.float64)
 
-
 def to_gl(mat4):
-    """Row-major 4x4 numpy -> column-major float array for glLoadMatrixf."""
     flat = mat4.T.astype(np.float32).flatten()
     return (ctypes.c_float * 16)(*flat)
-
 
 def eye_view_matrix(eye):
     eye_to_head = hmd_mat34_to_np(vr_system.getEyeToHeadTransform(eye).m)
     return np.linalg.inv(eye_to_head)
 
-
 def eye_projection_matrix(eye):
     return hmd_mat44_to_np(vr_system.getProjectionMatrix(eye, ZNEAR, ZFAR).m)
-
 
 left_view_gl = to_gl(eye_view_matrix(openvr.Eye_Left))
 right_view_gl = to_gl(eye_view_matrix(openvr.Eye_Right))
@@ -373,13 +484,7 @@ right_proj_gl = to_gl(eye_projection_matrix(openvr.Eye_Right))
 
 LAYERS = (("back", BASE_DEPTH), ("mid", MID_DEPTH), ("front", FRONT_DEPTH))
 
-
 def draw_layers():
-    """Draw the 3 depth planes back-to-front with alpha cutout blending.
-    Every plane is sized to the SAME angular extent (scaled proportionally
-    to its depth), so they stay visually aligned when viewed head-on but
-    separate into real disparity between the two eyes -- that disparity is
-    the actual 'pop'."""
     aspect = fb_w / fb_h
     opengl32.glEnable(GL_BLEND)
     opengl32.glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
@@ -443,7 +548,6 @@ def draw_mirror():
     opengl32.glBindTexture(GL_TEXTURE_2D, 0)
     sdl2.SDL_GL_SwapWindow(window)
 
-
 print(f"HMD recommended render target: {hmd_w}x{hmd_h}  (rendering eyes at {eye_w}x{eye_h})")
 print("Running stereo VR loop with faux depth-layer parallax, targeting 60fps. Press Ctrl+C to exit.")
 
@@ -493,4 +597,3 @@ finally:
     sdl2.SDL_DestroyWindow(window)
     sdl2.SDL_Quit()
     core.retro_deinit()
-
