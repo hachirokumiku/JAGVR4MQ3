@@ -333,8 +333,8 @@ glCheckFramebufferStatus = ctypes.WINFUNCTYPE(ctypes.c_uint, ctypes.c_uint)(get_
 glGenTextures = ctypes.WINFUNCTYPE(None, ctypes.c_int, ctypes.POINTER(ctypes.c_uint))(get_proc('glGenTextures'))
 glBindTexture = ctypes.WINFUNCTYPE(None, ctypes.c_uint, ctypes.c_uint)(get_proc('glBindTexture'))
 glTexParameteri = ctypes.WINFUNCTYPE(None, ctypes.c_uint, ctypes.c_uint, ctypes.c_int)(get_proc('glTexParameteri'))
-glTexImage2D = ctypes.WINFUNCTYPE(None, ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p)(get_proc('glTexImage2D'))
-glTexSubImage2D = ctypes.WINFUNCTYPE(None, ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p)(get_proc('glTexSubImage2D'))
+glTexImage2D = ctypes.WINFUNCTYPE(None, ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p)(get_proc('glTexImage2D'[...])
+glTexSubImage2D = ctypes.WINFUNCTYPE(None, ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p)(get_proc('glTexSubIm[...])
 
 glViewport = ctypes.WINFUNCTYPE(None, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int)(get_proc('glViewport'))
 glClearColor = ctypes.WINFUNCTYPE(None, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float)(get_proc('glClearColor'))
@@ -493,9 +493,10 @@ def setup_quad_vbo():
         -0.5, -0.5, 0.0, 0.0, 1.0,
          0.5, -0.5, 0.0, 1.0, 1.0,
     ], dtype=np.float32)
-    buf = (ctypes.c_uint * 1)()
+    # Use a single c_uint (not a 1-element array) so ctypes.byref() gives a pointer to c_uint
+    buf = ctypes.c_uint(0)
     glGenBuffers(1, ctypes.byref(buf))
-    vbo = buf[0]
+    vbo = buf.value
     glBindBuffer(GL_ARRAY_BUFFER, vbo)
     glBufferData(GL_ARRAY_BUFFER, data.nbytes, data.ctypes.data_as(ctypes.c_void_p), GL_STATIC_DRAW)
     glBindBuffer(GL_ARRAY_BUFFER, 0)
