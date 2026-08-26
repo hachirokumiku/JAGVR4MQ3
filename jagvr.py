@@ -333,8 +333,8 @@ glCheckFramebufferStatus = ctypes.WINFUNCTYPE(ctypes.c_uint, ctypes.c_uint)(get_
 glGenTextures = ctypes.WINFUNCTYPE(None, ctypes.c_int, ctypes.POINTER(ctypes.c_uint))(get_proc('glGenTextures'))
 glBindTexture = ctypes.WINFUNCTYPE(None, ctypes.c_uint, ctypes.c_uint)(get_proc('glBindTexture'))
 glTexParameteri = ctypes.WINFUNCTYPE(None, ctypes.c_uint, ctypes.c_uint, ctypes.c_int)(get_proc('glTexParameteri'))
-glTexImage2D = ctypes.WINFUNCTYPE(None, ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p)(get_proc('glTexImage2D'[...])
-glTexSubImage2D = ctypes.WINFUNCTYPE(None, ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p)(get_proc('glTexSubIm[...])
+glTexImage2D = ctypes.WINFUNCTYPE(None, ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p)(get_proc('glTexImage2D'))
+glTexSubImage2D = ctypes.WINFUNCTYPE(None, ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p)(get_proc('glTexSubImage2D'))
 
 glViewport = ctypes.WINFUNCTYPE(None, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int)(get_proc('glViewport'))
 glClearColor = ctypes.WINFUNCTYPE(None, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float)(get_proc('glClearColor'))
@@ -464,7 +464,12 @@ def hmd_mat44_to_np(m):
     return np.array([[m[r][c] for c in range(4)] for r in range(4)], dtype=np.float64)
 
 def to_gl(mat4):
-    flat = mat4.T.astype(np.float32).flatten()
+    # Robustly accept any array-like with 16 elements and produce a ctypes float[16]
+    arr = np.asarray(mat4, dtype=np.float32)
+    if arr.size != 16:
+        raise ValueError(f"to_gl expects a 4x4 matrix (16 elements), got shape {arr.shape} with {arr.size} elements")
+    arr = arr.reshape((4,4))
+    flat = arr.T.flatten()
     return (ctypes.c_float * 16)(*flat)
 
 def eye_view_matrix(eye):
@@ -515,6 +520,13 @@ def draw_layers_vbo(view_np):
     glEnableClientState(0x8074)  # GL_VERTEX_ARRAY
     glVertexPointer(3, GL_FLOAT, stride, ctypes.c_void_p(0))
     glTexCoordPointer(2, GL_FLOAT, stride, ctypes.c_void_p(12))
+
+    # view_np should already be a 4x4 numpy matrix; use it directly and ensure shape
+    view_arr = np.asarray(view_np, dtype=np.float32)
+    if view_arr.size != 16:
+        raise ValueError(f"draw_layers_vbo expects a 4x4 view matrix (16 elems), got shape {view_arr.shape} with {view_arr.size} elements")
+    view_arr = view_arr.reshape((4,4))
+
     for name, depth in LAYERS:
         scale = depth / BASE_DEPTH
         half_h = (BASE_HEIGHT * scale) / 2.0
@@ -523,10 +535,7 @@ def draw_layers_vbo(view_np):
         model[0,0] = 2.0 * half_w
         model[1,1] = 2.0 * half_h
         model[2,3] = -depth
-        modelview = np.array([[view_np[i] for i in range(4)] for _ in range(4)])
-        # compute modelview: view_np is ctypes array; use provided view_np as numpy if possible
-        # we'll convert view_np to numpy earlier when calling
-        mv = modelview @ model
+        mv = view_arr @ model
         glLoadMatrixf(to_gl(mv))
         glBindTexture(GL_TEXTURE_2D, layer_tex[name])
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
