@@ -75,8 +75,9 @@ audio_buffer = bytearray()
 @ctypes.CFUNCTYPE(None, ctypes.c_int16, ctypes.c_int16)
 def audio_sample_cb(left, right):
     global audio_buffer
-    audio_buffer.extend(left.to_bytes(2, 'little', signed=True))
-    audio_buffer.extend(right.to_bytes(2, 'little', signed=True))
+    # append 16-bit little-endian samples
+    audio_buffer.extend(int(left).to_bytes(2, 'little', signed=True))
+    audio_buffer.extend(int(right).to_bytes(2, 'little', signed=True))
 
 @ctypes.CFUNCTYPE(ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t)
 def audio_sample_batch_cb(data, frames):
@@ -254,16 +255,24 @@ if jaguar_ram is not None:
 # --- SDL / GL setup -----------------------------------------------------
 sdl2.SDL_Init(sdl2.SDL_INIT_VIDEO | sdl2.SDL_INIT_AUDIO)
 sdl2.SDL_GL_SetAttribute(sdl2.SDL_GL_CONTEXT_PROFILE_MASK, sdl2.SDL_GL_CONTEXT_PROFILE_COMPATIBILITY)
-window = sdl2.SDL_CreateWindow(b"Jaguar VR - Quest 3 / SteamVR", 100, 100, 640, 480, sdl2.SDL_WINDOW_OPENGL | sdl2.SDL_WINDOW_SHOWN)
+# create a logical window size; mirror drawable will match desktop DPI automatically
+window = sdl2.SDL_CreateWindow(b"Jaguar VR - Quest 3 / SteamVR", 100, 100, 1280, 720, sdl2.SDL_WINDOW_OPENGL | sdl2.SDL_WINDOW_SHOWN)
 gl_context = sdl2.SDL_GL_CreateContext(window)
 sdl2.SDL_GL_MakeCurrent(window, gl_context)
 sdl2.SDL_GL_SetSwapInterval(0)
 
-want_spec = sdl2.SDL_AudioSpec(48000, sdl2.AUDIO_S16LSB, 2, 512)
+# Audio: allow lowering device sample rate and reducing internal buffer size to improve latency/CPU
+WANT_SR = int(os.environ.get("JAGVR_AUDIO_RATE", "32000"))  # default to 32 kHz to reduce CPU
+SRC_SR = int(os.environ.get("JAGVR_SRC_RATE", "48000"))    # expected core sample rate (override if different)
+WANT_SAMPLES = int(os.environ.get("JAGVR_AUDIO_SAMPLES", "256"))
+want_spec = sdl2.SDL_AudioSpec(WANT_SR, sdl2.AUDIO_S16LSB, 2, WANT_SAMPLES)
 have_spec = sdl2.SDL_AudioSpec(0,0,0,0)
 audio_dev = sdl2.SDL_OpenAudioDevice(None, 0, ctypes.byref(want_spec), ctypes.byref(have_spec), 0)
 if audio_dev > 0:
     sdl2.SDL_PauseAudioDevice(audio_dev, 0)
+    actual_dev_rate = int(getattr(have_spec, 'freq', WANT_SR))
+else:
+    actual_dev_rate = WANT_SR
 
 # OpenVR
 try:
@@ -341,6 +350,19 @@ glClearColor = ctypes.WINFUNCTYPE(None, ctypes.c_float, ctypes.c_float, ctypes.c
 glClear = ctypes.WINFUNCTYPE(None, ctypes.c_uint)(get_proc('glClear'))
 glMatrixMode = ctypes.WINFUNCTYPE(None, ctypes.c_uint)(get_proc('glMatrixMode'))
 glLoadMatrixf = ctypes.WINFUNCTYPE(None, ctypes.POINTER(ctypes.c_float))(get_proc('glLoadMatrixf'))
+
+# Load glLoadIdentity (with fallback to glLoadMatrixf(identity))
+try:
+    glLoadIdentity = ctypes.WINFUNCTYPE(None)(get_proc('glLoadIdentity'))
+except Exception:
+    def glLoadIdentity():
+        identity = (ctypes.c_float * 16)(
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0
+        )
+        glLoadMatrixf(identity)
 
 glEnable = ctypes.WINFUNCTYPE(None, ctypes.c_uint)(get_proc('glEnable'))
 glDisable = ctypes.WINFUNCTYPE(None, ctypes.c_uint)(get_proc('glDisable'))
@@ -558,13 +580,28 @@ def render_eye(fbo, view_gl, proj_gl, w, h):
     glBindFramebuffer(GL_FRAMEBUFFER, 0)
 
 def draw_mirror_vbo():
+    # Use drawable size (framebuffer pixels) to support DPI scaling on desktop
     win_w, win_h = ctypes.c_int(0), ctypes.c_int(0)
-    sdl2.SDL_GetWindowSize(window, ctypes.byref(win_w), ctypes.byref(win_h))
-    glViewport(0,0, win_w.value, win_h.value)
+    sdl2.SDL_GL_GetDrawableSize(window, ctypes.byref(win_w), ctypes.byref(win_h))
+    drawable_w, drawable_h = win_w.value, win_h.value
+    if drawable_w <= 0 or drawable_h <= 0:
+        # fallback to window size
+        w2, h2 = ctypes.c_int(0), ctypes.c_int(0)
+        sdl2.SDL_GetWindowSize(window, ctypes.byref(w2), ctypes.byref(h2))
+        drawable_w, drawable_h = w2.value, h2.value
+
+    glViewport(0,0, drawable_w, drawable_h)
     glClearColor(ctypes.c_float(0), ctypes.c_float(0), ctypes.c_float(0), ctypes.c_float(1))
     glClear(GL_COLOR_BUFFER_BIT)
+    # set projection/modelview to identity
     glMatrixMode(GL_PROJECTION); glLoadIdentity()
     glMatrixMode(GL_MODELVIEW); glLoadIdentity()
+    # The unit quad in the VBO is -0.5..0.5; scale it to full screen by loading a model matrix of 2x
+    scale_model = np.eye(4, dtype=np.float32)
+    scale_model[0,0] = 2.0
+    scale_model[1,1] = 2.0
+    glLoadMatrixf(to_gl(scale_model))
+
     glEnable(GL_TEXTURE_2D)
     glBindTexture(GL_TEXTURE_2D, left_tex)
     vbo = setup_quad_vbo()
@@ -586,6 +623,30 @@ glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
 
 perf_freq = sdl2.SDL_GetPerformanceFrequency()
 
+# simple audio resampler (linear interpolation) to adapt core source rate -> device rate
+def resample_audio(raw_bytes, src_rate, dst_rate):
+    if src_rate == dst_rate or len(raw_bytes) == 0:
+        return raw_bytes
+    import numpy as _np
+    arr = _np.frombuffer(raw_bytes, dtype=_np.int16)
+    if arr.size < 2:
+        return b''
+    # ensure stereo
+    if arr.size % 2 != 0:
+        arr = arr[:-1]
+    arr = arr.reshape(-1,2)
+    src_len = arr.shape[0]
+    dst_len = max(1, int(src_len * float(dst_rate) / float(src_rate)))
+    # sample positions
+    x = _np.linspace(0, src_len - 1, num=src_len)
+    x_new = _np.linspace(0, src_len - 1, num=dst_len)
+    left = _np.interp(x_new, x, arr[:,0]).astype(_np.int16)
+    right = _np.interp(x_new, x, arr[:,1]).astype(_np.int16)
+    out = _np.empty((dst_len * 2,), dtype=_np.int16)
+    out[0::2] = left
+    out[1::2] = right
+    return out.tobytes()
+
 try:
     while True:
         frame_start = sdl2.SDL_GetPerformanceCounter()
@@ -598,8 +659,20 @@ try:
         if nb is not None:
             nb.poll_services()
         if audio_dev > 0 and len(audio_buffer) > 0:
-            sdl2.SDL_QueueAudio(audio_dev, bytes(audio_buffer), len(audio_buffer))
-            audio_buffer.clear()
+            # resample to the device's actual rate if needed and queue to SDL
+            try:
+                raw = bytes(audio_buffer)
+                out = resample_audio(raw, SRC_SR, actual_dev_rate)
+                if out:
+                    sdl2.SDL_QueueAudio(audio_dev, out, len(out))
+                audio_buffer.clear()
+            except Exception:
+                # fallback: queue raw bytes
+                try:
+                    sdl2.SDL_QueueAudio(audio_dev, bytes(audio_buffer), len(audio_buffer))
+                except Exception:
+                    pass
+                audio_buffer.clear()
         if frame_ready and fb_data:
             frame_ready = False
             build_depth_layers()
