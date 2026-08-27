@@ -71,18 +71,20 @@ def video_cb(data, width, height, pitch):
         frame_ready = True
 
 audio_buffer = bytearray()
+audio_lock = False
 
 @ctypes.CFUNCTYPE(None, ctypes.c_int16, ctypes.c_int16)
 def audio_sample_cb(left, right):
-    global audio_buffer
-    # append 16-bit little-endian samples
-    audio_buffer.extend(int(left).to_bytes(2, 'little', signed=True))
-    audio_buffer.extend(int(right).to_bytes(2, 'little', signed=True))
+    global audio_buffer, audio_lock
+    if not audio_lock:
+        # append 16-bit little-endian samples
+        audio_buffer.extend(int(left).to_bytes(2, 'little', signed=True))
+        audio_buffer.extend(int(right).to_bytes(2, 'little', signed=True))
 
 @ctypes.CFUNCTYPE(ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t)
 def audio_sample_batch_cb(data, frames):
-    global audio_buffer
-    if data and frames > 0:
+    global audio_buffer, audio_lock
+    if data and frames > 0 and not audio_lock:
         size = frames * 4
         audio_buffer.extend(ctypes.string_at(data, size))
     return frames
@@ -96,7 +98,7 @@ _controller_state = {
     'left_buttons': 0,
     'right_buttons': 0,
 }
-_THUMBSTICK_DEADZONE = 0.35
+_THUMBSTICK_DEADZONE = 0.25
 
 @ctypes.CFUNCTYPE(None)
 def input_poll_cb():
@@ -146,11 +148,11 @@ def input_poll_cb():
             ax0 = ay0 = ax1 = ay1 = 0.0
         if is_left:
             s['left_axes'] = (ax0, ay0)
-            s['left_trigger'] = ax1 if abs(ax1) > 0.01 else ay1
+            s['left_trigger'] = max(abs(ax1), abs(ay1))
             s['left_buttons'] = buttons
         else:
             s['right_axes'] = (ax0, ay0)
-            s['right_trigger'] = ax1 if abs(ax1) > 0.01 else ay1
+            s['right_trigger'] = max(abs(ax1), abs(ay1))
             s['right_buttons'] = buttons
 
 @ctypes.CFUNCTYPE(ctypes.c_int16, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint)
@@ -159,28 +161,41 @@ def input_state_cb(port, device, index, id):
         return 0
     s = _controller_state
     lx, ly = s['left_axes']
-    up = ly < -_THUMBSTICK_DEADZONE
-    down = ly > _THUMBSTICK_DEADZONE
-    left = lx < -_THUMBSTICK_DEADZONE
-    right = lx > _THUMBSTICK_DEADZONE
-    a = s['right_trigger'] > 0.45
-    b = s['left_trigger'] > 0.45
-    if id == 0:
-        return 1 if up else 0
-    if id == 1:
-        return 1 if down else 0
-    if id == 2:
-        return 1 if left else 0
-    if id == 3:
-        return 1 if right else 0
-    if id == 4:
-        return 1 if a else 0
-    if id == 5:
-        return 1 if b else 0
-    if id == 6:
-        return 0
-    if id == 7:
-        return 1 if (s['left_buttons'] or s['right_buttons']) else 0
+    rx, ry = s['right_axes']
+    
+    # Apply deadzone to both axes
+    def apply_deadzone(x, y, dz=_THUMBSTICK_DEADZONE):
+        mag = (x*x + y*y) ** 0.5
+        if mag < dz:
+            return 0.0, 0.0
+        scale = (mag - dz) / (1.0 - dz)
+        return x * scale, y * scale
+    
+    lx, ly = apply_deadzone(lx, ly)
+    rx, ry = apply_deadzone(rx, ry)
+    
+    # Jaguar control mapping:
+    # 0: UP, 1: DOWN, 2: LEFT, 3: RIGHT (D-pad / left stick)
+    # 4: A, 5: B (right/left triggers or buttons)
+    # 6: Option/Menu (right shoulder button)
+    # 7: Pause (button press)
+    
+    if id == 0:  # UP
+        return 1 if ly < -_THUMBSTICK_DEADZONE else 0
+    if id == 1:  # DOWN
+        return 1 if ly > _THUMBSTICK_DEADZONE else 0
+    if id == 2:  # LEFT
+        return 1 if lx < -_THUMBSTICK_DEADZONE else 0
+    if id == 3:  # RIGHT
+        return 1 if lx > _THUMBSTICK_DEADZONE else 0
+    if id == 4:  # A button (right trigger or button)
+        return 1 if (s['right_trigger'] > 0.5 or (s['right_buttons'] & 0x1)) else 0
+    if id == 5:  # B button (left trigger or button)
+        return 1 if (s['left_trigger'] > 0.5 or (s['left_buttons'] & 0x1)) else 0
+    if id == 6:  # Option/Menu
+        return 1 if ((s['left_buttons'] | s['right_buttons']) & 0x4) else 0
+    if id == 7:  # Pause (any button combo)
+        return 1 if ((s['left_buttons'] | s['right_buttons']) & 0x2) else 0
     return 0
 
 core.retro_set_environment(env_cb)
@@ -262,17 +277,19 @@ sdl2.SDL_GL_MakeCurrent(window, gl_context)
 sdl2.SDL_GL_SetSwapInterval(0)
 
 # Audio: allow lowering device sample rate and reducing internal buffer size to improve latency/CPU
-WANT_SR = int(os.environ.get("JAGVR_AUDIO_RATE", "32000"))  # default to 32 kHz to reduce CPU
+WANT_SR = int(os.environ.get("JAGVR_AUDIO_RATE", "48000"))  # match typical core rate
 SRC_SR = int(os.environ.get("JAGVR_SRC_RATE", "48000"))    # expected core sample rate (override if different)
-WANT_SAMPLES = int(os.environ.get("JAGVR_AUDIO_SAMPLES", "256"))
+WANT_SAMPLES = int(os.environ.get("JAGVR_AUDIO_SAMPLES", "512"))
 want_spec = sdl2.SDL_AudioSpec(WANT_SR, sdl2.AUDIO_S16LSB, 2, WANT_SAMPLES)
 have_spec = sdl2.SDL_AudioSpec(0,0,0,0)
 audio_dev = sdl2.SDL_OpenAudioDevice(None, 0, ctypes.byref(want_spec), ctypes.byref(have_spec), 0)
 if audio_dev > 0:
     sdl2.SDL_PauseAudioDevice(audio_dev, 0)
     actual_dev_rate = int(getattr(have_spec, 'freq', WANT_SR))
+    print(f"Audio device opened: {actual_dev_rate} Hz, {getattr(have_spec, 'channels', 2)} channels, {getattr(have_spec, 'samples', WANT_SAMPLES)} samples")
 else:
     actual_dev_rate = WANT_SR
+    print(f"Warning: could not open audio device, falling back to {WANT_SR} Hz")
 
 # OpenVR
 try:
@@ -634,14 +651,14 @@ def resample_audio(raw_bytes, src_rate, dst_rate):
     # ensure stereo
     if arr.size % 2 != 0:
         arr = arr[:-1]
-    arr = arr.reshape(-1,2)
+    arr = arr.reshape(-1, 2)
     src_len = arr.shape[0]
     dst_len = max(1, int(src_len * float(dst_rate) / float(src_rate)))
     # sample positions
-    x = _np.linspace(0, src_len - 1, num=src_len)
+    x = _np.arange(src_len, dtype=_np.float32)
     x_new = _np.linspace(0, src_len - 1, num=dst_len)
-    left = _np.interp(x_new, x, arr[:,0]).astype(_np.int16)
-    right = _np.interp(x_new, x, arr[:,1]).astype(_np.int16)
+    left = _np.interp(x_new, x, arr[:, 0]).astype(_np.int16)
+    right = _np.interp(x_new, x, arr[:, 1]).astype(_np.int16)
     out = _np.empty((dst_len * 2,), dtype=_np.int16)
     out[0::2] = left
     out[1::2] = right
@@ -658,33 +675,38 @@ try:
         core.retro_run()
         if nb is not None:
             nb.poll_services()
+        
+        # Audio queue: lock briefly, drain, and queue
         if audio_dev > 0 and len(audio_buffer) > 0:
-            # resample to the device's actual rate if needed and queue to SDL
+            audio_lock = True
             try:
                 raw = bytes(audio_buffer)
-                out = resample_audio(raw, SRC_SR, actual_dev_rate)
-                if out:
-                    sdl2.SDL_QueueAudio(audio_dev, out, len(out))
                 audio_buffer.clear()
-            except Exception:
-                # fallback: queue raw bytes
+            finally:
+                audio_lock = False
+            
+            if raw:
                 try:
-                    sdl2.SDL_QueueAudio(audio_dev, bytes(audio_buffer), len(audio_buffer))
-                except Exception:
+                    out = resample_audio(raw, SRC_SR, actual_dev_rate)
+                    if out:
+                        sdl2.SDL_QueueAudio(audio_dev, out, len(out))
+                except Exception as e:
                     pass
-                audio_buffer.clear()
+        
         if frame_ready and fb_data:
             frame_ready = False
             build_depth_layers()
             render_eye(left_fbo, left_view_gl, left_proj_gl, eye_w, eye_h)
             render_eye(right_fbo, right_view_gl, right_proj_gl, eye_w, eye_h)
             draw_mirror_vbo()
+        
         compositor.submit(openvr.Eye_Left, left_vr_tex, eye_bounds, 0)
         compositor.submit(openvr.Eye_Right, right_vr_tex, eye_bounds, 0)
         compositor.postPresentHandoff()
+        
         elapsed = (sdl2.SDL_GetPerformanceCounter() - frame_start) / perf_freq
         remaining = TARGET_FRAME_TIME - elapsed
-        if remaining > 0:
+        if remaining > 0.001:
             sdl2.SDL_Delay(int(remaining * 1000))
 except (KeyboardInterrupt, SystemExit):
     pass
